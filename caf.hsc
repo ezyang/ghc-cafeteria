@@ -4,10 +4,7 @@
 
 #include "Rts.h"
 
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import Control.Concurrent
-import Control.Concurrent.Chan
 import Control.Exception
 import Foreign.Storable
 import Foreign.C
@@ -17,15 +14,12 @@ import Control.Monad
 import Foreign.Marshal.Array
 import GHC.Prim
 import GHC.Ptr
-import Unsafe.Coerce
 import System.IO.Unsafe
-import System.Environment.Executable
-import qualified Data.IntMap.Strict as IntMap
-import Data.IntMap (IntMap)
 import System.IO
 
-import Data.Elf
 import GHC.HeapView
+
+import SymLookup
 
 data Bdescr
 
@@ -39,29 +33,9 @@ bdescrLink = #{peek bdescr, link}
 exampleCAF :: (Int, Int)
 exampleCAF = (unsafePerformIO (putStrLn "XXX" >> return 2), 99999)
 
--- debugging assistance for finding out what the static thing is
-
--- same bittedness only please!
-globalSymbolTable :: IntMap ByteString
-globalSymbolTable
-  = IntMap.fromList
-  . concatMap (\e -> case snd (steName e) of
-      Nothing -> []
-      Just v -> [(unsafeCoerce (steValue e) :: Int, BS.copy v)])
-  . concat
-  . parseSymbolTables
-  . parseElf
-  $ unsafePerformIO (BS.readFile =<< getExecutablePath)
-
-lookupSymbol :: Ptr a -> Maybe ByteString
-lookupSymbol x = IntMap.lookup (fromIntegral (ptrToIntPtr x)) globalSymbolTable
-
 main :: IO ()
 main = do
     hSetBuffering stdout NoBuffering
-    putStr "Loading symbol table... "
-    evaluate globalSymbolTable
-    putStrLn "done."
     sol <- recordStaticObjectList
     out <- newMVar ()
     let process x@(Ptr a) = do
@@ -70,21 +44,22 @@ main = do
             -- synchronize though
             (## v ##) -> do
                 wait <- newEmptyMVar
-                mt <- newEmptyMVar
-                t <- forkIO $ do
-                    threadDelay (10 * 1000000) -- in seconds
-                    m <- tryTakeMVar wait
-                    case m of
-                        Nothing -> do
-                            killThread =<< takeMVar mt
-                            withMVar out (const (putStr ("\n" ++ show (lookupSymbol x))))
-                        Just _ -> return () -- do nothing
-                t' <- forkIO $ staticEvaluate (Box v)
+                t <- forkIO $ staticEvaluate (Box v)
                             -- need to catch exceptions since a lot of
                             -- CAFs are things like 'error "WHOOPS"'
                             `catch` (\(SomeException _) -> return ())
                             `finally` putMVar wait ()
-                putMVar mt t'
+                _ <- forkIO $ do
+                    threadDelay (10 * 1000000) -- in seconds
+                    m <- tryTakeMVar wait
+                    case m of
+                        Nothing -> do
+                            killThread t
+                            sym <- lookupSymbol x
+                            withMVar out . const $ case sym of
+                                Nothing -> putStr ("\n" ++ show x)
+                                Just s -> putStr ("\n" ++ show s)
+                        Just _ -> return () -- do nothing
                 readMVar wait
                 withMVar out (const (putStr "."))
     chan <- newChan
@@ -105,10 +80,10 @@ main = do
     let number_of_workers = 6
     waits <- replicateM number_of_workers $ do
         wait <- newEmptyMVar
-        forkIO (worker >> putMVar wait ())
+        _ <- forkIO (worker >> putMVar wait ())
         return wait
     go sol
-    replicateM number_of_workers (writeChan chan Nothing)
+    replicateM_ number_of_workers (writeChan chan Nothing)
     mapM_ takeMVar waits
     freeRecordedStaticObjectList
     putStrLn ""
