@@ -1,0 +1,12 @@
+name:                ghc-cafeteria
+version:             0.1.0.0
+license-file:        LICENSE
+build-type:          Simple
+cabal-version:       >=1.8
+
+Executable caf
+  main-is:             Main.hs
+  other-modules:       SymLookup
+  build-depends:       base, ghc-prim, ghc-heap-view ==0.5.2, containers, bytestring, elf, executable-path
+  build-tools:         hsc2hs
+  ghc-options:         -fforce-recomp
