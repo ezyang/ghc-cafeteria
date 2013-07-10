@@ -3,8 +3,8 @@
 #define _GNU_SOURCE
 
 #include "Rts.h"
-#include <dlfcn.h>
 
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Control.Concurrent
 import Control.Exception
@@ -13,132 +13,106 @@ import Foreign.C
 import Foreign.Ptr
 import System.Mem
 import Control.Monad
-import Text.Printf
 import Foreign.Marshal.Array
 import GHC.Prim
 import GHC.Ptr
 import Unsafe.Coerce
-import GHC.HeapView
 import System.IO.Unsafe
-import Foreign.Marshal.Alloc
-import Data.Elf
 import System.Environment.Executable
-import Data.List
 import qualified Data.IntMap as IntMap
+import Data.IntMap (IntMap)
+
+import Data.Elf
+import GHC.HeapView
 
 data Bdescr
-data Dl_info
 
 bdescrStart, bdescrFree :: Ptr Bdescr -> IO (Ptr a)
 bdescrStart = #{peek bdescr, start}
 bdescrFree = #{peek bdescr, free}
-
 bdescrLink :: Ptr Bdescr -> IO (Ptr Bdescr)
 bdescrLink = #{peek bdescr, link}
 
--- r17s_info
-{-# NOINLINE nerf #-}
-nerf = unsafePerformIO (putStrLn "NERF should be above the line" >> return (2 :: Int))
+{-# NOINLINE exampleCAF #-}
+exampleCAF :: Int
+exampleCAF = unsafePerformIO $ do
+    putStrLn "This CAF should be evaluated before we reach the end of the program"
+    return 2
+
+-- debugging assistance for finding out what the static thing is
 
 -- same bittedness only please!
-elf = IntMap.fromList . concatMap (\e ->
-            case snd (steName e) of
-                Nothing -> []
-                Just v -> [(unsafeCoerce (steValue e) :: Int, v)])
-            . concat . parseSymbolTables . parseElf $ unsafePerformIO (BS.readFile =<< getExecutablePath)
+globalSymbolTable :: IntMap ByteString
+globalSymbolTable
+  = IntMap.fromList
+  . concatMap (\e -> case snd (steName e) of
+      Nothing -> []
+      Just v -> [(unsafeCoerce (steValue e) :: Int, v)])
+  . concat
+  . parseSymbolTables
+  . parseElf
+  $ unsafePerformIO (BS.readFile =<< getExecutablePath)
 
-lookupElf x = IntMap.lookup (fromIntegral (ptrToIntPtr x)) elf
+lookupSymbol :: Ptr a -> Maybe ByteString
+lookupSymbol x = IntMap.lookup (fromIntegral (ptrToIntPtr x)) globalSymbolTable
 
-
+main :: IO ()
 main = do
-    poke record_static 1
-    performGC
-    sol <- peek recorded_static_object_list
+    sol <- recordStaticObjectList
     let go p = do
         start <- bdescrStart p
-        free <-  bdescrFree p
-        let length = minusPtr free start `div` sizeOf (undefined :: Ptr a)
-        xs <- peekArray length start :: IO [Ptr (Ptr Any)]
-        -- printf "bd = %s (start = %s, free = %s)\n" (show p) (show start) (show free)
-        forM_ xs $ \(Ptr a) ->
-            -- unsafeCoerce should become a no-op
-            -- p <- peek x
-            -- print (IntMap.lookup (fromIntegral (ptrToIntPtr x)) elf)
-            {-
-            let b = IntMap.lookup (fromIntegral (ptrToIntPtr x)) elf == Just "r17s_closure"
-            when b $ do
-                symlookup x
-                putStrLn "Bang" >> print (unsafeCoerce x :: Int)
-                -}
-            -- print =<< symlookup p
-            -- (ptr, _, _) <- getClosureRaw (unsafeCoerce x :: Any)
+        pfree <-  bdescrFree p
+        let len = minusPtr pfree start `div` sizeOf (undefined :: Ptr a)
+        xs <- peekArray len start
+        forM_ xs $ \x@(Ptr a) -> do
+            print (lookupSymbol x)
             case addrToAny## a of
-                (## v ##) -> forkIO $ primDeepEvaluate (Box v) `catch` (\(SomeException _) -> return ())
+                -- seems to go faster when you use forkIO. Probably should
+                -- synchronize though
+                (## v ##) -> forkIO $ primDeepEvaluate (Box v)
+                                        -- need to catch exceptions since a lot of
+                                        -- CAFs are things like 'error "WHOOPS"'
+                                        `catch` (\(SomeException _) -> return ())
         next <- bdescrLink p
-        when (next /= nullPtr) (go next)
+        when (next /= nullPtr) $ go next
     go sol
     freeRecordedStaticObjectList
     putStrLn "------------------"
-    print nerf
+    print exampleCAF
 
 -- like evaluate . rnf, but requires no type class instance
 primDeepEvaluate :: Box -> IO ()
 primDeepEvaluate x = do
     let force = case x of Box a -> evaluate a >> primDeepEvaluate x
+        evalAll = mapM_ primDeepEvaluate
     closure <- getBoxedClosureData x
-    -- putStrLn (takeWhile (/=' ') (show closure))
     case closure of
-        ConsClosure {ptrArgs = ps} -> mapM_ primDeepEvaluate ps
         ThunkClosure {} -> force
         SelectorClosure {} -> force
+        -- forcing a blackhole causes us to WAIT for the true thread.
+        -- This should essentially never happen because we're supposed to
+        -- be evaluating CAFs first, but who knows!
+        BlackholeClosure {} -> force
         IndClosure {indirectee = p} -> primDeepEvaluate p
-        -- this case is tricky!!!
-        BlackholeClosure {} -> do
-        {-
-            (info, _, _) <- case x of Box a -> getClosureRaw a
-            print x
-            print =<< symlookup info
-            -}
-            force
-        APClosure {fun = p, payload = ps} -> mapM_ primDeepEvaluate (p:ps)
-        PAPClosure {fun = p, payload = ps} -> mapM_ primDeepEvaluate (p:ps)
-        APStackClosure {fun = p, payload = ps} -> mapM_ primDeepEvaluate (p:ps)
-        -- do not look into mutable variables
-        ArrWordsClosure {} -> return ()
-        MutArrClosure {mccPayload = ps} -> return ()
-        MutVarClosure {var = p} -> return ()
-        MVarClosure {value = p} -> return ()
-        FunClosure {ptrArgs = ps} -> mapM_ primDeepEvaluate ps
+        ConsClosure {ptrArgs = ps} -> evalAll ps
+        FunClosure {ptrArgs = ps} -> evalAll ps
+        -- gotta do these because some "mutable arrays" are actually
+        -- frozen and thus immutable, and SafeHaskell may allow these
+        -- I think ghc-heap-view is MISSING SOME
+        MutArrClosure {mccPayload = ps} -> evalAll ps
+        APClosure {fun = p, payload = ps} -> evalAll (p:ps)
+        PAPClosure {fun = p, payload = ps} -> evalAll (p:ps)
+        APStackClosure {fun = p, payload = ps} -> evalAll (p:ps)
+        -- unenterable stuff and mutable stuff
         _ -> return ()
 
-symlookup :: Ptr a -> IO (Maybe String)
-symlookup p = do
-    allocaBytes #{size Dl_info} $ \info -> do
-        r <- dladdr p info
-        if (r == 0)
-            then return Nothing
-            else do
-                sname <- #{peek Dl_info, dli_sname} info
-                if sname == nullPtr
-                    then return Nothing
-                    else do
-                        name <- peekCString sname
-                        return (Just name)
+-- make sure you free!
+recordStaticObjectList :: IO (Ptr Bdescr)
+recordStaticObjectList = do
+    poke record_static 1
+    performGC
+    peek recorded_static_object_list
 
 foreign import ccall "&record_static" record_static :: Ptr CInt
 foreign import ccall "&recorded_static_object_list" recorded_static_object_list :: Ptr (Ptr Bdescr)
 foreign import ccall "freeRecordedStaticObjectList" freeRecordedStaticObjectList :: IO ()
-
-foreign import ccall "dladdr" dladdr :: Ptr a -> Ptr Dl_info -> IO CInt
-{-
-           typedef struct {
-               const char *dli_fname;  /* Pathname of shared object that
-                                          contains address */
-               void       *dli_fbase;  /* Address at which shared object
-                                          is loaded */
-               const char *dli_sname;  /* Name of nearest symbol with address
-                                          lower than addr */
-               void       *dli_saddr;  /* Exact address of symbol named
-                                          in dli_sname */
-           } Dl_info;
-           -}
