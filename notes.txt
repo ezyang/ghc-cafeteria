@@ -1,0 +1,31 @@
+When compiled with -O these give us trouble
+
+    "base_GHCziIOziEncoding_getFileSystemEncoding11_closure"
+    "base_GHCziIOziEncoding_getFileSystemEncoding10_closure"
+    "base_GHCziIOziEncoding_getFileSystemEncoding9_closure"
+    "base_GHCziIOziEncoding_getFileSystemEncoding12_closure"
+    "base_GHCziIOziEncoding_getFileSystemEncoding8_closure"
+    "base_GHCziIOziEncoding_getFileSystemEncoding7_closure"
+
+These correspond to
+
+    setLocaleEncoding, setFileSystemEncoding, setForeignEncoding :: TextEncoding -> IO ()
+    (getLocaleEncoding, setLocaleEncoding)         = mkGlobal initLocaleEncoding
+    (getFileSystemEncoding, setFileSystemEncoding) = mkGlobal initFileSystemEncoding
+    (getForeignEncoding, setForeignEncoding)       = mkGlobal initForeignEncoding
+
+    mkGlobal :: a -> (IO a, a -> IO ())
+    mkGlobal x = unsafePerformIO $ do
+        x_ref <- newIORef x
+        return (readIORef x_ref, writeIORef x_ref)
+
+We seem to be deadlocking on the black holes or something.
+
+----
+
+"rceE_closure"
+"rceq_closure"
+"rcer_closure"
+"rces_closure"
+
+These seem to be [0..] (infinite lists of ascending integers)
