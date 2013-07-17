@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface, EmptyDataDecls, MagicHash, OverloadedStrings, UnboxedTuples #-}
+{-# LANGUAGE ForeignFunctionInterface, EmptyDataDecls, MagicHash, OverloadedStrings, UnboxedTuples, GHCForeignImportPrim #-}
 
 #define _GNU_SOURCE
 
@@ -14,8 +14,10 @@ import Control.Monad
 import Foreign.Marshal.Array
 import GHC.Prim
 import GHC.Ptr
+import GHC.Word
 import System.IO.Unsafe
 import System.IO
+import Data.IORef
 import Data.Bits
 import Data.Word
 import Data.List
@@ -39,9 +41,13 @@ bdescrLink = #{peek bdescr, link}
 -- loops don't halt processing.
 number_of_workers = 6
 
+{-# NOINLINE marker #-}
+marker :: IORef (Maybe ThreadId)
+marker = unsafePerformIO (newIORef Nothing)
+
 {-# NOINLINE exampleCAF #-}
 exampleCAF :: Int
-exampleCAF = unsafePerformIO (putStrLn "XXX" >> return 2)
+exampleCAF = unsafePerformIO (myThreadId >>= writeIORef marker . Just >> putStr "XXX" >> return 2)
 
 {-# NOINLINE out #-}
 out = unsafePerformIO (newMVar ())
@@ -57,7 +63,8 @@ main = do
     -- no pointers are going to be made non-updatable, we can turn
     -- this off (but we don't, at the moment).  Note that the
     -- static object list (which is currently scavenged by the GC)
-    -- is not sufficient, unless we update it to scavenge SRTs.
+    -- is not sufficient, unless we update it to scavenge SRTs even
+    -- when it sees an indirection.
     setKeepCAFs
     hSetBuffering stdout NoBuffering
     sol <- recordStaticObjectList
@@ -67,24 +74,33 @@ main = do
         case addrToAny## a of
           (## v ##) -> do
             wait <- newEmptyMVar
-            t <- forkIO $ staticEvaluate cond x (Box v)
-                        -- need to catch exceptions since a lot of
-                        -- CAFs are things like 'error ...'
-                        `catch` (\(SomeException _) -> return ())
-                        `finally` putMVar wait ()
+            let run = do
+                staticEvaluate cond x (Box v)
+                m <- readIORef marker
+                tid <- myThreadId
+                when (m == Just tid) $ do
+                writeIORef marker Nothing
+                notifyNonUpdatable x
+                makeNonUpdatable x
+                {-
+                evaluate exampleCAF
+                printClosure (asBox exampleCAF)
+                -}
+            -- need to catch exceptions since a lot of
+            -- CAFs are things like 'error ...'
+            t <- forkIO $ run `catch` (\(SomeException _) -> return ())
+                              `finally` putMVar wait ()
             _ <- forkIO $ do
                 threadDelay (1000000 `div` 2) -- in seconds
                 m <- tryTakeMVar wait
                 when (m == Nothing) $ do
                 killThread t -- wait is now filled (if it's not we'll deadlock)
                 -- print some debugging information
-                Just orig_sym <- lookupSymbol x
-                Just new_sym <- lookupSymbol =<< #{peek StgIndStatic, noupd_info} x
-                sync $ putStrLn ("\n" ++ B8.unpack orig_sym ++ " -> " ++ B8.unpack new_sym)
+                notifyNonUpdatable x
                 -- make it non-updatable
                 makeNonUpdatable x
             readMVar wait
-            sync (putStr ".")
+            -- sync (putStr ".")
     chan <- newChan
     let worker = do
         r <- readChan chan
@@ -109,7 +125,13 @@ main = do
     replicateM_ number_of_workers (writeChan chan Nothing)
     mapM_ takeMVar waits
     putStrLn "\n------------------"
-    print exampleCAF
+    print =<< evaluate (exampleCAF) -- CANNOT use print directly, the show'd version will get CAF'd!!!
+    print =<< evaluate (exampleCAF)
+
+notifyNonUpdatable x = do
+    Just orig_sym <- lookupSymbol x
+    Just new_sym <- lookupSymbol =<< #{peek StgIndStatic, noupd_info} x
+    sync $ putStrLn (B8.unpack orig_sym ++ " -> " ++ B8.unpack new_sym)
 
 makeNonUpdatable :: Ptr a -> IO ()
 makeNonUpdatable x = do
