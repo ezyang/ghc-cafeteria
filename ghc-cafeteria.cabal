@@ -9,4 +9,4 @@ Executable caf
   other-modules:       SymLookup
   build-depends:       base, ghc-prim, ghc-heap-view ==0.5.2, containers, bytestring, elf, executable-path
   build-tools:         hsc2hs
-  ghc-options:         -fforce-recomp -debug
+  ghc-options:         -fforce-recomp -debug -rtsopts -fno-omit-yields -O2
